@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>🔌 LLM Proxy</title>
+  <style>
+    body {
+      background-color: #000;
+      color: #fff;
+      font-family: sans-serif;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    code {
+      background-color: #222;
+      color: #0f0;
+      padding: 0.2em 0.4em;
+      border-radius: 4px;
+    }
+    li {
+      margin-bottom: 0.5em;
+    }
+  </style>
+</head>
+<body>
+  <h1>OpenAI-compatible proxy to OpenRouter</h1>
+  <p>The goal to fix <a href="https://chub.ai" target="_blank">chub.ai</a> proxy interface limitations:</p>
+  <li> <code>presence_penalty</code> hardcoded to 0.8</li>
+  <li> <code>max_completion_tokens</code> hardcoded to 400 (or 4000)</li>
+  <p><code>temperature</code>, <code>frequency_penalty</code>, <code>top_p</code> are passed through.</p>
+  <p>Use <code>https://silkyy-llmproxy.hf.space</code> as entry. API-token in <code>Authorization</code> header is passed through.</p>
+</body>
+</html>

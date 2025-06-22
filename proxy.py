@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 import httpx
+from starlette.responses import FileResponse
 
 app = FastAPI()
 
@@ -51,9 +52,9 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict)
         'temperature': body.get("temperature"),
         'top_p': body.get('top_p'),
         "max_tokens": body.get("max_tokens"),
-        # the only parameters that are valid (presence_penalty is hardcoded to 0.8)
         'stream': body.get('stream', False),
     }
+    # the only parameters that are valid (presence_penalty is hardcoded to 0.8, 'Repetition Penalty' just doesn't exists for openai)
     if 'frequency_penalty' in body:
         payload['frequency_penalty'] = body['frequency_penalty']
     if 'top_p' in body:
@@ -87,6 +88,11 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict)
         print(f"❌ Proxy Error: {e}")
         raise HTTPException(status_code=502, detail="Failed to fetch from Proxy")
 
+###
+
+@app.get("/")
+async def root():
+    return FileResponse(Path(__file__).parent / 'index.html')
 
 ###
 
