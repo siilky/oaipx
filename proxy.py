@@ -79,7 +79,22 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict)
                 json=payload
             )
             openrouter_response.raise_for_status()
-            return openrouter_response.json()
+            openrouter_data = openrouter_response.json()
+
+            if 'choices' in openrouter_data and len(openrouter_data['choices']) > 0:
+                first_choice = openrouter_data['choices'][0]
+                message = first_choice.get('message', {})
+                completion = message.get('content', '')
+                reasoning = message.get('reasoning', '')
+
+                usage = openrouter_data.get('usage', {})
+                prompt_tokens = usage.get('prompt_tokens', 0)
+                completion_tokens = usage.get('completion_tokens', 0)
+
+                print(
+                    f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] OpR completion prompt {prompt_tokens}: text {completion_tokens} tk ({len(completion)}{(f' reasoning: {len(reasoning)}' if reasoning else '')})")
+
+            return openrouter_data
 
     except httpx.HTTPStatusError as e:
         print(f"❌ Proxy Error {e.response.status_code}: {e.response.text}")
@@ -88,11 +103,13 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict)
         print(f"❌ Proxy Error: {e}")
         raise HTTPException(status_code=502, detail="Failed to fetch from Proxy")
 
+
 ###
 
 @app.get("/")
 async def root():
     return FileResponse(Path(__file__).parent / 'index.html')
+
 
 ###
 
@@ -173,64 +190,29 @@ async def messages(request: Request, model: str):
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
-    try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            openrouter_response = await client.post(
-                OPENROUTER_COMPLETIONS_URL,
-                headers={
-                    "Authorization": auth_header,
-                    "Content-Type": "application/json",
-                    "http-referrer": "https://chub.ai",
-                    "x-title": "Chub AI Proxy"
-                },
-                json={
-                    'model': model,
-                    # 'google/gemini-2.5-pro',
-                    'messages': body.get('messages', []),
-                    'temperature': body.get("temperature", 1.0),
-                    'top_p': body.get('top_p', 1.0),
-                    # "max_tokens": body.get("max_tokens", 4096),
-                    # "stop": body.get("stop_sequences", []),
-                    'stream': False,
+    openrouter_data = await _proxy_to_openrouter(model, auth_header, body, headers)
+    print_json(openrouter_data, 2)
+
+    # Transform OpenRouter response to Anthropic format
+    if 'choices' in openrouter_data and len(openrouter_data['choices']) > 0:
+        first_choice = openrouter_data['choices'][0]
+        stop_reason = first_choice.get('finish_reason', 'unknown')
+        message = first_choice.get('message', {})
+        completion = message.get('content', '')
+
+        return {
+            'content': [
+                {
+                    'type': 'text',
+                    'text': completion
                 }
-            )
-
-        openrouter_data = openrouter_response.json()
-
-        # Transform OpenRouter response to Anthropic format
-        if 'choices' in openrouter_data and len(openrouter_data['choices']) > 0:
-            first_choice = openrouter_data['choices'][0]
-            stop_reason = first_choice.get('finish_reason', 'unknown')
-            message = first_choice.get('message', {})
-            completion = message.get('content', '')
-            reasoning = message.get('reasoning', '')
-
-            usage = openrouter_data.get('usage', {})
-            prompt_tokens = usage.get('prompt_tokens', 0)
-            completion_tokens = usage.get('completion_tokens', 0)
-
-            print(
-                f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] OpR completion prompt {prompt_tokens}: text {completion_tokens} tk ({len(completion)}{(f' reasoning: {len(reasoning)}' if reasoning else '')})")
-
-            print_json(openrouter_data, 2)
-
-            return {
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': completion
-                    }
-                ],
-                'stop_reason': stop_reason,
-                'id': openrouter_data['id'],
-                'type': 'message',
-            }
-        else:
-            raise HTTPException(status_code=502, detail="Invalid response from OpenRouter")
-
-    except Exception as e:
-        print("❌ OpenRouter request failed:", e)
-        raise HTTPException(status_code=502, detail="Failed to fetch from OpenRouter")
+            ],
+            'stop_reason': stop_reason,
+            'id': openrouter_data['id'],
+            'type': 'message',
+        }
+    else:
+        raise HTTPException(status_code=502, detail="Invalid response from proxy")
 
 
 if __name__ == "__main__":
