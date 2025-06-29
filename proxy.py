@@ -44,7 +44,7 @@ def print_json(data, depth=1, current_level=1):
 
 ###
 
-async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict):
+async def _proxy_to_openrouter(model: str, auth: str, body: dict, params_override: dict = {}):
     # Construct payload for OpenRouter, which is OpenAI-compatible.
     payload = {
         'model': model,
@@ -59,12 +59,14 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict)
         payload['frequency_penalty'] = body['frequency_penalty']
     if 'top_p' in body:
         payload['top_p'] = body['top_p']
-
-    # Map Anthropic's 'stop_sequences' to OpenAI's 'stop'
-    if 'stop_sequences' in body:
-        payload['stop'] = body['stop_sequences']
-    else:
+    if 'stop' in body:
         payload['stop'] = body.get('stop')
+
+    # Override or add parameters from URL to the request body
+    for key, value in params_override.items():
+        body[key] = value
+
+    print_json(payload)
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -93,6 +95,7 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, headers: dict)
 
                 print(
                     f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] OpR completion prompt {prompt_tokens}: text {completion_tokens} tk ({len(completion)}{(f' reasoning: {len(reasoning)}' if reasoning else '')})")
+                print_json(openrouter_data, 2)
 
             return openrouter_data
 
@@ -129,16 +132,37 @@ async def list_models():
         raise HTTPException(status_code=500, detail="Internal server error while processing models")
 
 
-@app.post("/chat/completions")
-async def completions(request: Request):
+@app.post("/{params:path}/chat/completions")
+async def completions_with_params(request: Request, params: str = ""):
     headers = dict(request.headers)
     body = await request.json()
 
-    model = body.get('model', '')
-    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {model}")
-    # for k, v in headers.items():
-    #    print(f"{k}: {v}")
-    print_json(body)
+    # Parse path parameters (format: param1=value1/param2=value2)
+    param_dict = {}
+    if params and params != "v1":  # Skip standard v1 prefix
+        for param in params.split('/'):
+            if '=' in param:
+                name, value = param.split('=', 1)
+                name = name.strip()
+                value = value.strip()
+                if not name or not value:
+                    continue
+
+                # Convert string values to appropriate types if needed
+                if value.lower() == 'true':
+                    param_dict[name] = True
+                elif value.lower() == 'false':
+                    param_dict[name] = False
+                elif value.isdigit():
+                    param_dict[name] = int(value)
+                elif value.replace('.', '', 1).isdigit():
+                    param_dict[name] = float(value)
+                else:
+                    param_dict[name] = value
+
+    model = body.get('model', DEFAULT_MODEL)
+
+    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {model} with params: {params}")
 
     # OpenAI uses 'Authorization' header for authentication
     if "Authorization" in headers or "authorization" in headers:
@@ -146,9 +170,13 @@ async def completions(request: Request):
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
-    openrouter_data = await _proxy_to_openrouter(model, auth_header, body, headers)
-    print_json(openrouter_data, 2)
+    openrouter_data = await _proxy_to_openrouter(model, auth_header, body, param_dict)
     return openrouter_data
+
+
+@app.post("/chat/completions")
+async def completions(request: Request):
+    return await completions_with_params(request)
 
 
 # anthropic API check
@@ -189,6 +217,10 @@ async def messages(request: Request, model: str):
         auth_header = 'Bearer ' + (headers.get('x-api-key') or headers.get('X-Api-key'))
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    # Map Anthropic's 'stop_sequences' to OpenAI's 'stop'
+    if 'stop_sequences' in body:
+        body['stop'] = body['stop_sequences']
 
     openrouter_data = await _proxy_to_openrouter(model, auth_header, body, headers)
     print_json(openrouter_data, 2)
