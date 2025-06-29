@@ -64,7 +64,7 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, params_overrid
 
     # Override or add parameters from URL to the request body
     for key, value in params_override.items():
-        body[key] = value
+        payload[key] = value
 
     print_json(payload)
 
@@ -162,7 +162,7 @@ async def completions_with_params(request: Request, params: str = ""):
 
     model = body.get('model', DEFAULT_MODEL)
 
-    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {model} with params: {params}")
+    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {model} with: {params}")
 
     # OpenAI uses 'Authorization' header for authentication
     if "Authorization" in headers or "authorization" in headers:
