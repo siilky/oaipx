@@ -1,37 +1,56 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
-  <title>🔌 LLM Proxy</title>
-  <style>
-    body {
-      background-color: #000;
-      color: #fff;
-      font-family: sans-serif;
-      padding: 2rem;
-      line-height: 1.6;
-    }
-    code {
-      background-color: #222;
-      color: #0f0;
-      padding: 0.2em 0.4em;
-      border-radius: 4px;
-    }
-    li {
-      margin-bottom: 0.5em;
-    }
-	a {
-      color: #0bf;
-      text-decoration: underline;
-    }
-  </style>
+    <meta charset="UTF-8">
+    <title>🔌 LLM Proxy</title>
+    <style>
+        body {
+            background-color: #000;
+            color: #fff;
+            font-family: sans-serif;
+            padding: 2rem;
+            line-height: 1.6;
+        }
+
+        code {
+            background-color: #222;
+            color: #0f0;
+            padding: 0.2em 0.4em;
+            border-radius: 4px;
+        }
+
+        li {
+            margin-bottom: 0.5em;
+        }
+
+        a {
+            color: #0bf;
+            text-decoration: underline;
+        }
+    </style>
 </head>
 <body>
-  <h1>OpenAI-compatible proxy to OpenRouter</h1>
-  <p>The goal to fix <a href="https://chub.ai" target="_blank">chub.ai</a> proxy interface limitations:</p>
-  <li> <code>presence_penalty</code> hardcoded to 0.8</li>
-  <li> <code>max_completion_tokens</code> hardcoded to 400 (or 4000)</li>
-  <p><code>temperature</code>, <code>frequency_penalty</code>, <code>top_p</code> are passed through.</p>
-  <p>Use <code>https://silkyy-llmproxy.hf.space</code> as entry. API-token in <code>Authorization</code> header is passed through.</p>
+<h1>OpenAI-compatible proxy to OpenRouter</h1>
+<p>Everything you wanted to do with API parameters but had no idea how to.</p>
+<p>Use <code>https://silkyy-llmproxy.hf.space</code> as entry. API-token in <code>Authorization</code> header is passed
+    through.</p>
+<p>The command syntax is <code>&ltname[=[value]]&gt</code>:</p>
+<ul>
+    <li><code>name</code> is equal to name=true</li>
+    <li><code>name=</code> will delete any already existing value</li>
+    <li><code>name=value</code> generic assignment, value can be a number, boolean, string (without quotes), or list (json-compatible)</li>
+</ul>
+<p>Following commands are available to use in system prompt:</p>
+<ul>
+    <li><code>&ltmodel=...&gt</code> override model used</li>
+    <li><code>&lttemperature=N&gt</code> set temperature</li>
+    <li><code>&lttop_p=N&gt</code> set top_p</li>
+    <li><code>&lttop_k=N&gt</code> set top_k</li>
+    <li><code>&ltpresence_penalty=N&gt</code> set presence_penalty</li>
+    <li><code>&ltmax_tokens=N&gt</code> set max_completion_tokens</li>
+    <li><code>&ltstop=[...]&gt</code> set stop sequence(s) (list or string)</li>
+    <li><code>&ltthinking=(True|False)&gt</code> enable thinking for model</li>
+    <li><code>&ltshow_thinking=(True|False)&gt</code> show thinking text in completion</li>
+</ul>
 </body>
 </html>

@@ -1,5 +1,6 @@
 import sys
-
+from copy import deepcopy
+from typing import Dict, Callable, Any, Tuple
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -9,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 import httpx
 from starlette.responses import FileResponse
+import re
 
 app = FastAPI()
 
@@ -44,60 +46,221 @@ def print_json(data, depth=1, current_level=1):
 
 ###
 
-async def _proxy_to_openrouter(model: str, auth: str, body: dict, params_override: dict = {}):
-    # Construct payload for OpenRouter, which is OpenAI-compatible.
-    payload = {
-        'model': model,
-        'messages': body.get('messages', []),
-        'temperature': body.get("temperature"),
-        'top_p': body.get('top_p'),
-        "max_tokens": body.get("max_tokens"),
-        'stream': body.get('stream', False),
-    }
-    # the only parameters that are valid (presence_penalty is hardcoded to 0.8, 'Repetition Penalty' just doesn't exists for openai)
-    if 'frequency_penalty' in body:
-        payload['frequency_penalty'] = body['frequency_penalty']
-    if 'top_p' in body:
-        payload['top_p'] = body['top_p']
-    if 'stop' in body:
-        payload['stop'] = body.get('stop')
+def set_model(request: dict, model):
+    if isinstance(model, str) and model:
+        request['model'] = model
 
-    # Override or add parameters from URL to the request body
-    for key, value in params_override.items():
-        payload[key] = value
 
-    print_json(payload)
+def set_temperature(request: dict, temperature):
+    if isinstance(temperature, (int, float)):
+        request['temperature'] = temperature
+    else:
+        request.pop('temperature', None)
+
+
+def set_top_p(request: dict, top_p):
+    if isinstance(top_p, (int, float)):
+        request['top_p'] = top_p
+    else:
+        request.pop('top_p', None)
+
+
+def set_top_k(request: dict, top_k):
+    if isinstance(top_k, (int, float)):
+        request['top_k'] = top_k
+    else:
+        request.pop('top_k', None)
+
+
+def set_presence_penalty(request: dict, presence_penalty):
+    if isinstance(presence_penalty, (int, float)):
+        request['presence_penalty'] = presence_penalty
+    else:
+        request.pop('presence_penalty', None)
+
+
+def set_max_tokens(request: dict, max_tokens):
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        request['max_completion_tokens'] = max_tokens
+    else:
+        request.pop('max_completion_tokens', None)
+
+
+def set_stop(request: dict, stop):
+    if isinstance(stop, (str, list)) and stop:
+        request['stop'] = [stop]
+    else:
+        request.pop('stop', None)
+
+
+def set_thinking(request: dict, thinking):
+    if isinstance(thinking, bool):
+        request['reasoning'] = {
+            'enabled': thinking,
+        }
+    elif isinstance(thinking, str) and thinking in ['high', 'medium', 'low']:
+        request['reasoning'] = {
+            'enabled': True,
+            'effort': thinking,
+        }
+    else:
+        request.pop('thinking', None)
+
+
+def set_show_thinking(request: dict, show_thinking):
+    # Reasoning tokens will appear in the reasoning field of each message.#
+    # so there's no much reason to turn it off at the api request
+    pass
+
+
+# commands are lowercase, but we allow uppercase in the text
+COMMANDS = {
+    'model': set_model,
+    'temperature': set_temperature,
+    'top_p': set_top_p,
+    'top_k': set_top_k,
+    'presence_penalty': set_presence_penalty,
+    'max_tokens': set_max_tokens,
+    'stop': set_stop,
+    'thinking': set_thinking,
+    'show_thinking': set_show_thinking,
+}
+
+
+###
+
+def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[str], Any]]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Extracts parameters based on handler keys and removes them from the text.
+
+    This function finds tags like <name>, <name=>, or <name=value>. If 'name'
+    is a key in `handlers`, the tag is treated as a command and
+    removed from the text.
+
+    Returns:
+        A tuple containing the cleaned text and extracted
+        parameters with their raw values.
+    """
+
+    pattern = re.compile(r'<([a-zA-Z0-9_]+)((?:=[^>]*)?)>', re.IGNORECASE)
+
+    valid_commands = set(handlers.keys())
+
+    params = {}
+
+    def replacer(match):
+        full_tag = match.group(0)
+        name = match.group(1).lower()
+        value_part = match.group(2)
+
+        if name not in valid_commands:
+            return full_tag  # Not a command we handle, leave it.
+
+        if value_part is None or value_part == "":
+            # Format: <name> -> True
+            value = True
+        elif value_part == "=":
+            # Format: <name=> -> ""
+            value = ""
+        else:
+            # Format: <name=value> -> "value" (as a string)
+            value = value_part[1:]  # Remove leading '='
+            if value.casefold() in ['true', 'yes', 'on']:
+                value = True
+            elif value.casefold() in ['false', 'no', 'off']:
+                value = False
+            elif '.' in value:
+                if value.replace('.', '', 1).isdigit():
+                    # Convert to float if it looks like a number
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass
+            elif value.isdigit():
+                # Convert to int if it looks like a number
+                value = int(value)
+            elif value.startswith('[') and value.endswith(']'):
+                # Convert to list if it looks like a list
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+
+        params[name] = value
+        return ""  # Remove the tag from the text
+
+    processed_text = pattern.sub(replacer, text)
+    return processed_text, params
+
+
+def process_commands(valid_commands: Dict[str, Callable[[str], Any]], request: dict) -> Dict[str, Any]:
+    for message in request['messages']:
+        if message.get('role') == 'system' and 'content' in message:
+            text, commands = extract_and_remove_commands(message['content'], valid_commands)
+
+            if commands:
+                # Update the message content with the cleaned text
+                message['content'] = text
+
+                for command, value in commands.items():
+                    if command in COMMANDS:
+                        try:
+                            COMMANDS[command](request, value)
+                        except Exception as e:
+                            print(f"Error processing command '{command}': {e}")
+                            # raise HTTPException(status_code=400, detail=f"Invalid command: {command_name}")
+            return commands
+    return {}
+
+
+async def _proxy_to_openrouter(headers: dict, body: dict):
+    if 'model' not in body:
+        body['model'] = DEFAULT_MODEL
+    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {body['model']}")
+
+    commands = process_commands(COMMANDS, body)
+
+    show_thinking = commands.get('show_thinking', False)
+
+    print_json(body)
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
             openrouter_response = await client.post(
                 OPENROUTER_COMPLETIONS_URL,
-                headers={
-                    "Authorization": auth,
-                    "Content-Type": "application/json",
-                    "http-referrer": "https://chub.ai",  # Optional: referrer spoofing
-                    "x-title": "Chub AI Proxy"  # Optional: client identification
-                },
-                json=payload
+                headers=headers,
+                json=body,
             )
             openrouter_response.raise_for_status()
-            openrouter_data = openrouter_response.json()
+            reply_data = openrouter_response.json()
 
-            if 'choices' in openrouter_data and len(openrouter_data['choices']) > 0:
-                first_choice = openrouter_data['choices'][0]
-                message = first_choice.get('message', {})
-                completion = message.get('content', '')
-                reasoning = message.get('reasoning', '')
+            if 'choices' in reply_data and len(reply_data['choices']) > 0:
+                if 'message' not in reply_data['choices'][0]:
+                    print("❌ Invalid response from proxy: 'message' field missing in choices")
+                    raise HTTPException(status_code=502, detail="Invalid response from proxy: 'message' field missing")
 
-                usage = openrouter_data.get('usage', {})
+                message = reply_data['choices'][0]['message']
+
+                if 'content' not in message:
+                    print("❌ Invalid response from proxy: 'content' field missing in message")
+                    raise HTTPException(status_code=502, detail="Invalid response from proxy: 'content' field missing in message")
+
+                completion = message['content']
+                reasoning = message.get('reasoning')
+
+                usage = reply_data.get('usage', {})
                 prompt_tokens = usage.get('prompt_tokens', 0)
                 completion_tokens = usage.get('completion_tokens', 0)
 
                 print(
-                    f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] OpR completion prompt {prompt_tokens}: text {completion_tokens} tk ({len(completion)}{(f' reasoning: {len(reasoning)}' if reasoning else '')})")
-                print_json(openrouter_data, 2)
+                    f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] OpR prompt {prompt_tokens}tk: text {completion_tokens}tk ({len(completion)}){(f' reasoning: {len(reasoning)}' if reasoning else '')}")
+                print_json(reply_data, 2)
 
-            return openrouter_data
+                # merge reasoning into the content if show_thinking is True
+                if show_thinking and reasoning:
+                    message['content'] = f'<think>{reasoning}</think>\n\n---\n{completion}'
+
+            return reply_data
 
     except httpx.HTTPStatusError as e:
         print(f"❌ Proxy Error {e.response.status_code}: {e.response.text}")
@@ -113,8 +276,6 @@ async def _proxy_to_openrouter(model: str, auth: str, body: dict, params_overrid
 async def root():
     return FileResponse(Path(__file__).parent / 'index.html')
 
-
-###
 
 @app.get("/models")
 async def list_models():
@@ -132,51 +293,26 @@ async def list_models():
         raise HTTPException(status_code=500, detail="Internal server error while processing models")
 
 
-@app.post("/{params:path}/chat/completions")
-async def completions_with_params(request: Request, params: str = ""):
-    headers = dict(request.headers)
-    body = await request.json()
+@app.post("/chat/completions")
+async def completions(request: Request):
+    headers = {}
 
-    # Parse path parameters (format: param1=value1/param2=value2)
-    param_dict = {}
-    if params and params != "v1":  # Skip standard v1 prefix
-        for param in params.split('/'):
-            if '=' in param:
-                name, value = param.split('=', 1)
-                name = name.strip()
-                value = value.strip()
-                if not name or not value:
-                    continue
-
-                # Convert string values to appropriate types if needed
-                if value.lower() == 'true':
-                    param_dict[name] = True
-                elif value.lower() == 'false':
-                    param_dict[name] = False
-                elif value.isdigit():
-                    param_dict[name] = int(value)
-                elif value.replace('.', '', 1).isdigit():
-                    param_dict[name] = float(value)
-                else:
-                    param_dict[name] = value
-
-    model = body.get('model', DEFAULT_MODEL)
-
-    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {model} with: {params}")
+    if 'Origin' in request.headers:
+        headers['Origin'] = request.headers['Origin']
+    if 'Referer' in request.headers:
+        headers['Referer'] = request.headers['Referer']
+    if 'User-Agent' in request.headers:
+        headers['User-Agent'] = request.headers['User-Agent']
 
     # OpenAI uses 'Authorization' header for authentication
-    if "Authorization" in headers or "authorization" in headers:
-        auth_header = headers.get("authorization") or headers.get("Authorization")
+    if "Authorization" in request.headers or "authorization" in request.headers:
+        headers['Authorization'] = request.headers.get("authorization") or request.headers.get("Authorization")
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
-    openrouter_data = await _proxy_to_openrouter(model, auth_header, body, param_dict)
-    return openrouter_data
-
-
-@app.post("/chat/completions")
-async def completions(request: Request):
-    return await completions_with_params(request)
+    body = await request.json()
+    reply = await _proxy_to_openrouter(headers, body)
+    return reply
 
 
 # anthropic API check
@@ -195,26 +331,15 @@ async def complete(request: Request, model: str):
     }
 
 
+# anthropic API endpoint
 @app.post('/messages')
-async def messages_default(request: Request):
-    return await messages(request, DEFAULT_MODEL)
-
-
-# @app.post("/chat/completions")
-@app.post('/{model:path}/messages')  # anthropic API endpoint
-async def messages(request: Request, model: str):
-    headers = dict(request.headers)
+async def messages(request: Request):
     body = await request.json()
 
-    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {model}")
-    # for k, v in headers.items():
-    #    print(f"{k}: {v}")
-    print_json(body)
-
-    auth_header = ''
+    headers = {}
     # anthropic api uses 'x-api-key' header for authentication
-    if "X-Api-key" in headers or "x-api-key" in headers:
-        auth_header = 'Bearer ' + (headers.get('x-api-key') or headers.get('X-Api-key'))
+    if "X-Api-key" in request.headers or "x-api-key" in request.headers:
+        headers['Authorization'] = 'Bearer ' + (request.headers.get('x-api-key') or request.headers.get('X-Api-key'))
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
@@ -222,12 +347,12 @@ async def messages(request: Request, model: str):
     if 'stop_sequences' in body:
         body['stop'] = body['stop_sequences']
 
-    openrouter_data = await _proxy_to_openrouter(model, auth_header, body, headers)
-    print_json(openrouter_data, 2)
+    reply = await _proxy_to_openrouter(headers, body)
+    print_json(reply, 2)
 
     # Transform OpenRouter response to Anthropic format
-    if 'choices' in openrouter_data and len(openrouter_data['choices']) > 0:
-        first_choice = openrouter_data['choices'][0]
+    if 'choices' in reply and len(reply['choices']) > 0:
+        first_choice = reply['choices'][0]
         stop_reason = first_choice.get('finish_reason', 'unknown')
         message = first_choice.get('message', {})
         completion = message.get('content', '')
@@ -240,7 +365,7 @@ async def messages(request: Request, model: str):
                 }
             ],
             'stop_reason': stop_reason,
-            'id': openrouter_data['id'],
+            'id': reply['id'],
             'type': 'message',
         }
     else:
