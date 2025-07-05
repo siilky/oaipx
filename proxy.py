@@ -1,16 +1,14 @@
-import sys
-from copy import deepcopy
-from typing import Dict, Callable, Any, Tuple
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 import json
+import re
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
+from typing import Dict, Callable, Any, Tuple
+
 import httpx
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import FileResponse
-import re
 
 app = FastAPI()
 
@@ -129,7 +127,7 @@ COMMANDS = {
 
 ###
 
-def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[str], Any]]) -> Tuple[str, Dict[str, Any]]:
+def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[Dict], Any]]) -> Tuple[str, Dict[str, Any]]:
     """
     Extracts parameters based on handler keys and removes them from the text.
 
@@ -193,7 +191,7 @@ def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[str], A
     return processed_text, params
 
 
-def process_commands(valid_commands: Dict[str, Callable[[str], Any]], request: dict) -> Dict[str, Any]:
+def process_commands(valid_commands: Dict[str, Callable[[Dict], Any]], request: Dict) -> Dict[str, Any]:
     for message in request['messages']:
         if message.get('role') == 'system' and 'content' in message:
             text, commands = extract_and_remove_commands(message['content'], valid_commands)
@@ -270,6 +268,18 @@ async def _proxy_to_openrouter(headers: dict, body: dict):
         raise HTTPException(status_code=502, detail="Failed to fetch from Proxy")
 
 
+def copy_headers(request: Request) -> dict:
+    """
+    Copies relevant headers from the request to the response.
+    """
+
+    headers = {}
+    for header in ['Origin', 'Referer', 'User-Agent', 'HTTP-Referer', 'X-Title', 'Content-Type']:
+        if header in request.headers:
+            headers[header] = request.headers[header]
+    return headers
+
+
 ###
 
 @app.get("/")
@@ -295,18 +305,10 @@ async def list_models():
 
 @app.post("/chat/completions")
 async def completions(request: Request):
-    headers = {}
-
-    if 'Origin' in request.headers:
-        headers['Origin'] = request.headers['Origin']
-    if 'Referer' in request.headers:
-        headers['Referer'] = request.headers['Referer']
-    if 'User-Agent' in request.headers:
-        headers['User-Agent'] = request.headers['User-Agent']
-
+    headers = copy_headers(request)
     # OpenAI uses 'Authorization' header for authentication
-    if "Authorization" in request.headers or "authorization" in request.headers:
-        headers['Authorization'] = request.headers.get("authorization") or request.headers.get("Authorization")
+    if "Authorization" in request.headers:
+        headers['Authorization'] = request["Authorization"]
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
@@ -320,11 +322,6 @@ async def completions(request: Request):
 # The current recommended API is the Messages API, which uses the /v1/messages endpoint.
 @app.post('/complete')
 async def complete_default(request: Request):
-    return await complete(request)
-
-
-@app.post('/{model:path}/complete')
-async def complete(request: Request, model: str):
     return {
         'completion': ' Hello! How can I help you today?',
         'stop_reason': 'stop_sequence',
@@ -334,9 +331,7 @@ async def complete(request: Request, model: str):
 # anthropic API endpoint
 @app.post('/messages')
 async def messages(request: Request):
-    body = await request.json()
-
-    headers = {}
+    headers = copy_headers(request)
     # anthropic api uses 'x-api-key' header for authentication
     if "X-Api-key" in request.headers or "x-api-key" in request.headers:
         headers['Authorization'] = 'Bearer ' + (request.headers.get('x-api-key') or request.headers.get('X-Api-key'))
@@ -344,6 +339,7 @@ async def messages(request: Request):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
     # Map Anthropic's 'stop_sequences' to OpenAI's 'stop'
+    body = await request.json()
     if 'stop_sequences' in body:
         body['stop'] = body['stop_sequences']
 
