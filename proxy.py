@@ -308,7 +308,7 @@ async def completions(request: Request):
     headers = copy_headers(request)
     # OpenAI uses 'Authorization' header for authentication
     if "Authorization" in request.headers:
-        headers['Authorization'] = request["Authorization"]
+        headers['Authorization'] = request.headers["Authorization"]
     else:
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
