@@ -85,8 +85,10 @@ def set_max_tokens(request: dict, max_tokens):
 
 
 def set_stop(request: dict, stop):
-    if isinstance(stop, (str, list)) and stop:
+    if isinstance(stop, str) and stop:
         request['stop'] = [stop]
+    elif isinstance(stop, list):
+        request['stop'] = [s for s in stop if isinstance(s, str) and s]
     else:
         request.pop('stop', None)
 
