@@ -1,11 +1,2 @@
----
-title: Llmproxy
-emoji: 🏃
-colorFrom: purple
-colorTo: indigo
-sdk: docker
-pinned: false
-short_description: llm proxy to OpenRouter
----
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+Running at https://p01--oaip--qww5vdr4p72c.code.run
