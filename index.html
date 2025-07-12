@@ -30,7 +30,7 @@
     </style>
 </head>
 <body>
-<h1>OpenAI-compatible proxy to OpenRouter</h1>
+<h1>OpenAI-compatible proxy to OpenRouter/Google AI</h1>
 <p>Everything you wanted to do with API parameters but had no idea how to.</p>
 <p>Use <code>https://silkyy-orp.hf.space</code> as entry. API-token in <code>Authorization</code> header is passed
     through.</p>
@@ -43,6 +43,7 @@
 <p>Following commands are available to use in system prompt:</p>
 <ul>
     <li><code>&ltmodel=...&gt</code> override model used</li>
+    <li><code>&ltautoroute=(True|False)&gt</code> automatically route <kbd>'google/'</kbd> or <kbd>'gemini-'</kbd> models to google API</li>
     <li><code>&lttemperature=N&gt</code> set temperature</li>
     <li><code>&lttop_p=N&gt</code> set top_p</li>
     <li><code>&lttop_k=N&gt</code> set top_k</li>

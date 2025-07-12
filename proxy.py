@@ -1,6 +1,8 @@
 import json
+import logging
+import os
 import re
-from datetime import datetime
+import sys
 from pathlib import Path
 from typing import Dict, Callable, Any, Tuple
 
@@ -10,6 +12,22 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import FileResponse
 
+logging.basicConfig(
+    level=logging.INFO,
+    # level=logging.DEBUG,
+    format="[%(asctime)s] %(levelname)-8s %(message)s",
+    datefmt="%Y%m%d %H:%M.%S",
+    stream=sys.stdout,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# get environment variables
+
+log_json_headers = os.environ.get("LOG_JSON_HEADERS", "false").lower() in ['true', '1', 'yes']
+
+logging.info(f'Logging JSON headers: {log_json_headers}')
+
+#
 app = FastAPI()
 
 app.add_middleware(
@@ -19,6 +37,7 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
+AISTUDIO_URL = 'https://generativelanguage.googleapis.com/v1beta/models'
 OPENROUTER_URL = 'https://openrouter.ai/api/v1'
 OPENROUTER_COMPLETIONS_URL = OPENROUTER_URL + '/chat/completions'
 OPENROUTER_MODELS_URL = OPENROUTER_URL + '/models'
@@ -26,6 +45,11 @@ DEFAULT_MODEL = 'openrouter/auto'
 
 
 def print_json(data, depth=1, current_level=1):
+    """ Prints JSON data in a structured format, limiting the depth of printed objects with current_level. """
+
+    if not log_json_headers:
+        return
+
     def process(obj, level):
         if isinstance(obj, dict):
             if level > depth:
@@ -39,7 +63,7 @@ def print_json(data, depth=1, current_level=1):
             return obj
 
     result = process(data, current_level)
-    print(json.dumps(result, indent=4, default=str))
+    logging.info(json.dumps(result, indent=4, default=str))
 
 
 ###
@@ -113,6 +137,10 @@ def set_show_thinking(request: dict, show_thinking):
     pass
 
 
+def set_autoroute(request: dict, autoroute):
+    pass
+
+
 # commands are lowercase, but we allow uppercase in the text
 COMMANDS = {
     'model': set_model,
@@ -124,6 +152,7 @@ COMMANDS = {
     'stop': set_stop,
     'thinking': set_thinking,
     'show_thinking': set_show_thinking,
+    'autoroute': set_autoroute,
 }
 
 
@@ -207,67 +236,215 @@ def process_commands(valid_commands: Dict[str, Callable[[Dict], Any]], request: 
                         try:
                             COMMANDS[command](request, value)
                         except Exception as e:
-                            print(f"Error processing command '{command}': {e}")
+                            logging.error(f"Failed to process command '{command}': {e}")
                             # raise HTTPException(status_code=400, detail=f"Invalid command: {command_name}")
             return commands
     return {}
 
 
-async def _proxy_to_openrouter(headers: dict, body: dict):
+def asResponse(text: str, finish_reason: str = None):
+    choice = {
+        'message': {
+            'role': 'assistant',
+            'content': text,
+        },
+    }
+
+    if finish_reason:
+        choice['finish_reason'] = finish_reason
+
+    return {
+        'choices': [choice]
+    }
+
+
+def merge_thinking(text: str, reasoning: str) -> str:
+    if reasoning:
+        return f'<think>{reasoning}\n---\n</think>\n{text}'
+    return text
+
+
+async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
+    model = body.get('model', DEFAULT_MODEL)
+    if model.startswith('google/'):
+        model = model.replace('google/', '', 1)
+
+    api_key = headers.get('Authorization')
+    api_key = api_key.replace('Bearer ', '', 1)
+    headers.pop('Authorization', None)
+
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"}
+    ]
+
+    # convert messages
+    contents = []
+    system_instructions = []
+
+    for message in body.get('messages', []):
+        if 'content' in message:
+            role = message.get('role', 'user').lower()
+
+            if role == 'system':
+                system_instructions.append({'text': message['content']})
+                continue
+
+            if role != 'user':
+                role = 'model'
+
+            contents.append({
+                'role': role,
+                'parts': [{'text': message['content']}]
+            })
+
+    config = {}
+    if 'temperature' in body:
+        config['temperature'] = body['temperature']
+    if 'top_p' in body:
+        config['topP'] = body['top_p']
+    if 'top_k' in body:
+        config['topK'] = body['top_k']
+    if 'presence_penalty' in body:
+        config['presencePenalty'] = body['presence_penalty']
+    if 'max_completion_tokens' in body:
+        config['maxOutputTokens'] = body['max_completion_tokens']
+    if 'stop' in body:
+        config['stopSequences'] = body['stop']
+    if 'reasoning' in body and isinstance(body['reasoning'], dict):
+        thinking_config = {}
+        if not body['reasoning'].get('enabled', False):
+            # disable thinking if disabled, otherwise unset it to use default
+            thinking_config['thinkingBudget'] = 0
+        if commands.get('show_thinking', False):
+            thinking_config['includeThoughts'] = True
+        config['thinkingConfig'] = thinking_config
+
+    url = f"{AISTUDIO_URL}/{model}:generateContent?key={api_key}"
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.post(
+            url,
+            headers=headers,
+            json={
+                'contents': contents,
+                'systemInstruction': {'parts': system_instructions},
+                'safetySettings': safety_settings,
+                'generationConfig': config,
+            }
+        )
+
+        response.raise_for_status()
+        reply = response.json()
+
+        print_json(reply, 3)
+
+        meta = reply.get('usageMetadata', {})
+        candidates_str = f"text {meta['candidatesTokenCount']}tk" if 'candidatesTokenCount' in meta else ''
+        reasoning_str = f", reasoning {meta['thoughtsTokenCount']}tk" if 'thoughtsTokenCount' in meta else '❌'
+
+        logging.info(f"GAI: prompt {meta['promptTokenCount']}tk => {candidates_str}{reasoning_str}")
+
+        completion = ''
+        reasoning = ''
+        finish_reason = ''
+
+        if 'candidates' in reply and len(reply['candidates']) > 0:
+            candidate = reply['candidates'][0]
+
+            if 'content' in candidate and 'parts' in candidate['content']:
+                for part in candidate['content']['parts']:
+                    if 'thought' in part and part['thought']:
+                        reasoning += part['text'] + '\n'
+                    else:
+                        completion += part['text'] + '\n'
+
+            # merge reasoning into the content if show_thinking is True
+            show_thinking = commands.get('show_thinking', False)
+            if show_thinking and reasoning:
+                completion = merge_thinking(completion, reasoning)
+
+            finish_reason = candidate.get('finishReason', '')
+        else:
+            # If no candidates are returned, form an error
+            if feedback := reply.get('promptFeedback'):
+                completion = json.dumps(feedback, indent=2)
+                finish_reason = feedback['blockReason']
+            else:
+                completion = "❌ Invalid response from API: 'candidates' field missing or empty"
+
+        return asResponse(completion, finish_reason)
+
+
+async def _proxy_openrouter_request(headers: dict, body: dict, commands: dict):
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.post(
+            OPENROUTER_COMPLETIONS_URL,
+            headers=headers,
+            json=body,
+        )
+        response.raise_for_status()
+        reply_data = response.json()
+
+        if 'choices' in reply_data and len(reply_data['choices']) > 0:
+            if 'message' not in reply_data['choices'][0]:
+                logging.error("❌ Invalid response from proxy: 'message' field missing in choices")
+                raise HTTPException(status_code=502, detail="Invalid response from proxy: 'message' field missing")
+
+            message = reply_data['choices'][0]['message']
+
+            if 'content' not in message:
+                logging.error("❌ Invalid response from proxy: 'content' field missing in message")
+                raise HTTPException(status_code=502, detail="Invalid response from proxy: 'content' field missing in message")
+
+            completion = message['content']
+            reasoning = message.get('reasoning')
+
+            usage = reply_data.get('usage', {})
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            completion_tokens = usage.get('completion_tokens', 0)
+
+            logging.info(
+                f"[OpR: prompt {prompt_tokens}tk => text {completion_tokens}tk ({len(completion)}){(f', reasoning: {len(reasoning)}' if reasoning else '')}")
+            print_json(reply_data, 2)
+
+            # merge reasoning into the content if show_thinking is True
+            show_thinking = commands.get('show_thinking', False)
+            if show_thinking and reasoning:
+                message['content'] = merge_thinking(message['content'], reasoning)
+
+        return reply_data
+
+
+async def _proxy_request(headers: dict, body: dict):
+    logging.info(f"--- input {len(body.get('messages', []))} messages ---")
+
     if 'model' not in body:
         body['model'] = DEFAULT_MODEL
-    print(f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] --- {body['model']}")
 
     commands = process_commands(COMMANDS, body)
 
-    show_thinking = commands.get('show_thinking', False)
-
     print_json(body)
 
+    # strip the <think> tags from the content (only from model messages)
+    if commands.get('show_thinking'):
+        for message in body['messages']:
+            if message.get('role') in ['model', 'assistant'] and 'content' in message:
+                message['content'] = re.sub(r'<think>.*?</think>', '', message['content'], flags=re.DOTALL)
+
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            openrouter_response = await client.post(
-                OPENROUTER_COMPLETIONS_URL,
-                headers=headers,
-                json=body,
-            )
-            openrouter_response.raise_for_status()
-            reply_data = openrouter_response.json()
 
-            if 'choices' in reply_data and len(reply_data['choices']) > 0:
-                if 'message' not in reply_data['choices'][0]:
-                    print("❌ Invalid response from proxy: 'message' field missing in choices")
-                    raise HTTPException(status_code=502, detail="Invalid response from proxy: 'message' field missing")
-
-                message = reply_data['choices'][0]['message']
-
-                if 'content' not in message:
-                    print("❌ Invalid response from proxy: 'content' field missing in message")
-                    raise HTTPException(status_code=502, detail="Invalid response from proxy: 'content' field missing in message")
-
-                completion = message['content']
-                reasoning = message.get('reasoning')
-
-                usage = reply_data.get('usage', {})
-                prompt_tokens = usage.get('prompt_tokens', 0)
-                completion_tokens = usage.get('completion_tokens', 0)
-
-                print(
-                    f"[{datetime.now().strftime('%Y%m%d_%H%M%S.%f')}] OpR prompt {prompt_tokens}tk: text {completion_tokens}tk ({len(completion)}){(f' reasoning: {len(reasoning)}' if reasoning else '')}")
-                print_json(reply_data, 2)
-
-                # merge reasoning into the content if show_thinking is True
-                if show_thinking and reasoning:
-                    message['content'] = f'<think>{reasoning}</think>\n\n---\n{completion}'
-
-            return reply_data
+        if commands.get('autoroute') and (body['model'].startswith('google/') or body['model'].startswith('gemini-')):
+            return await _proxy_aistudio_request(headers, body, commands)
+        else:
+            return await _proxy_openrouter_request(headers, body, commands)
 
     except httpx.HTTPStatusError as e:
-        print(f"❌ Proxy Error {e.response.status_code}: {e.response.text}")
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        return asResponse(f"❌ Proxy Error {e.response.status_code}: {e.response.text}")
     except Exception as e:
-        print(f"❌ Proxy Error: {e}")
-        raise HTTPException(status_code=502, detail="Failed to fetch from Proxy")
+        return asResponse(f"❌ Proxy Error: {str(e)}")
 
 
 def copy_headers(request: Request) -> dict:
@@ -298,10 +475,10 @@ async def list_models():
             return response.json()
 
     except httpx.RequestError as e:
-        print(f"❌ Models request failed: {e}")
+        logging.error(f"❌ Models request failed: {e}")
         raise HTTPException(status_code=502, detail="Failed to fetch models from OpenRouter")
     except Exception as e:
-        print(f"❌ Models processing error: {e}")
+        logging.error(f"❌ Models processing error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error while processing models")
 
 
@@ -315,7 +492,7 @@ async def completions(request: Request):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
     body = await request.json()
-    reply = await _proxy_to_openrouter(headers, body)
+    reply = await _proxy_request(headers, body)
     return reply
 
 
@@ -345,7 +522,7 @@ async def messages(request: Request):
     if 'stop_sequences' in body:
         body['stop'] = body['stop_sequences']
 
-    reply = await _proxy_to_openrouter(headers, body)
+    reply = await _proxy_request(headers, body)
     print_json(reply, 2)
 
     # Transform OpenRouter response to Anthropic format
