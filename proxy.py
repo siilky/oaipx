@@ -137,9 +137,8 @@ def set_show_thinking(request: dict, show_thinking):
     pass
 
 
-def set_autoroute(request: dict, autoroute):
+def empty_handler(request: dict, value):
     pass
-
 
 # commands are lowercase, but we allow uppercase in the text
 COMMANDS = {
@@ -152,7 +151,9 @@ COMMANDS = {
     'stop': set_stop,
     'thinking': set_thinking,
     'show_thinking': set_show_thinking,
-    'autoroute': set_autoroute,
+    'autoroute': empty_handler,
+    'or_key': empty_handler,
+    'google_key': empty_handler,
 }
 
 
@@ -435,10 +436,17 @@ async def _proxy_request(headers: dict, body: dict):
                 message['content'] = re.sub(r'<think>.*?</think>', '', message['content'], flags=re.DOTALL)
 
     try:
-
         if commands.get('autoroute') and (body['model'].startswith('google/') or body['model'].startswith('gemini-')):
+            # when autoroute is enabled and we are on Google Gemini or Google AI Studio, use google_key option
+            if google_key := commands.get('google_key'):
+                headers['Authorization'] = f'Bearer {google_key}'
+
             return await _proxy_aistudio_request(headers, body, commands)
         else:
+            # when no autoroute we take OR key first
+            if key := (commands.get('or_key') or commands.get('google_key')):
+                headers['Authorization'] = f'Bearer {key}'
+
             return await _proxy_openrouter_request(headers, body, commands)
 
     except httpx.HTTPStatusError as e:
@@ -494,57 +502,6 @@ async def completions(request: Request):
     body = await request.json()
     reply = await _proxy_request(headers, body)
     return reply
-
-
-# anthropic API check
-# The /v1/complete endpoint belongs to Anthropic's legacy Completions API.
-# The current recommended API is the Messages API, which uses the /v1/messages endpoint.
-@app.post('/complete')
-async def complete_default(request: Request):
-    return {
-        'completion': ' Hello! How can I help you today?',
-        'stop_reason': 'stop_sequence',
-    }
-
-
-# anthropic API endpoint
-@app.post('/messages')
-async def messages(request: Request):
-    headers = copy_headers(request)
-    # anthropic api uses 'x-api-key' header for authentication
-    if "X-Api-key" in request.headers or "x-api-key" in request.headers:
-        headers['Authorization'] = 'Bearer ' + (request.headers.get('x-api-key') or request.headers.get('X-Api-key'))
-    else:
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    # Map Anthropic's 'stop_sequences' to OpenAI's 'stop'
-    body = await request.json()
-    if 'stop_sequences' in body:
-        body['stop'] = body['stop_sequences']
-
-    reply = await _proxy_request(headers, body)
-    print_json(reply, 2)
-
-    # Transform OpenRouter response to Anthropic format
-    if 'choices' in reply and len(reply['choices']) > 0:
-        first_choice = reply['choices'][0]
-        stop_reason = first_choice.get('finish_reason', 'unknown')
-        message = first_choice.get('message', {})
-        completion = message.get('content', '')
-
-        return {
-            'content': [
-                {
-                    'type': 'text',
-                    'text': completion
-                }
-            ],
-            'stop_reason': stop_reason,
-            'id': reply['id'],
-            'type': 'message',
-        }
-    else:
-        raise HTTPException(status_code=502, detail="Invalid response from proxy")
 
 
 if __name__ == "__main__":
