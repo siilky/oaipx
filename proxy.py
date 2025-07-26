@@ -10,7 +10,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, RedirectResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -288,6 +288,7 @@ def process_modifiers(valid_modifiers: Dict[str, Callable[[Dict], Any]], request
 
         message_index += 1
 
+
 def asResponse(text: str, finish_reason: str = None):
     choice = {
         'message': {
@@ -546,6 +547,11 @@ async def completions(request: Request):
     body = await request.json()
     reply = await _proxy_request(headers, body)
     return reply
+
+
+@app.get("/chat/completions")
+async def completions_redirect():
+    return RedirectResponse(url="/", status_code=302)
 
 
 if __name__ == "__main__":
