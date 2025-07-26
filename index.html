@@ -45,7 +45,7 @@
 <div class="content-wrapper">
     <h1>OpenAI-compatible proxy to OpenRouter/Google AI</h1>
     <p>Everything you wanted to do with API parameters but had no idea how to.</p>
-    <p>Use <code>https://p01--oaip--qww5vdr4p72c.code.run</code> as entry. API-token in <code>Authorization</code>
+    <p>Use <code>https://p01--oaip--qww5vdr4p72c.code.run/chat/completions</code> as entry. API key in <code>Authorization</code>
         header is passed
         through.</p>
     <p>The command syntax is <code>&ltname[=[value]]&gt</code>:</p>
@@ -58,10 +58,6 @@
     </ul>
     <p>Following commands are available to use in system prompt:</p>
     <ul>
-        <li><code>&ltmodel=...&gt</code> override model used</li>
-        <li><code>&ltautoroute=(True|False)&gt</code> automatically route <kbd>'google/'</kbd> or <kbd>'gemini-'</kbd>
-            models to google API
-        </li>
         <li><code>&lttemperature=N&gt</code> set temperature</li>
         <li><code>&lttop_p=N&gt</code> set top_p</li>
         <li><code>&lttop_k=N&gt</code> set top_k</li>
@@ -70,7 +66,19 @@
         <li><code>&ltstop=[...]&gt</code> set stop sequence(s) (list or string)</li>
         <li><code>&ltthinking=(True|False|low|medium|high)&gt</code> enable thinking for model</li>
         <li><code>&ltshow_thinking=(True|False)&gt</code> show thinking text in completion</li>
+        <li><code>&ltmodel=...&gt</code> override model used</li>
+        <li><code>&ltautoroute=(True|False)&gt</code> automatically route <kbd>'google/'</kbd> or <kbd>'gemini-'</kbd> models to google API
+        </li>
+        <li><code>&ltgoogle_key=...&gt</code> Override Google API key (when using <code>&lt;autoroute=True&gt;</code> with gemini)</li>
+        <li><code>&ltor_key=...&gt</code> Override API key (when using <code>&lt;autoroute=False&gt;</code> with any model)</li>
     </ul>
+    <p>Modifying commands</p>
+    <ul>
+        <li><code>&lt&ltbreak_sys&gt&gt</code> split <kbd>"system"</kbd> message into <kbd>"system"</kbd> (before) and <kbd>"user"</kbd>
+            (after) parts.
+        </li>
+    </ul>
+
     <hr width="75%">
     <p align="center" style="margin-top: 2rem;">
         <a href="https://github.com/siilky/oaipx"

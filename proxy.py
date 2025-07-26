@@ -132,13 +132,14 @@ def set_thinking(request: dict, thinking):
 
 
 def set_show_thinking(request: dict, show_thinking):
-    # Reasoning tokens will appear in the reasoning field of each message.#
+    # Reasoning tokens will appear in the reasoning field of each message.
     # so there's no much reason to turn it off at the api request
     pass
 
 
 def empty_handler(request: dict, value):
     pass
+
 
 # commands are lowercase, but we allow uppercase in the text
 COMMANDS = {
@@ -157,6 +158,26 @@ COMMANDS = {
 }
 
 
+def modify_break_sys(messages: list, message_index: int, entry_pos: int):
+    # cutoff the system message at the position of the <<break_sys>> tag and insert user message after (all possible) system's
+    text = messages[message_index].get('content', '')
+    messages[message_index]['content'] = text[:entry_pos].rstrip()  # Remove trailing whitespace after the break
+
+    while messages[message_index].get('role') == 'system':
+        message_index += 1
+
+    # Insert a new user message after the system messages
+    messages.insert(message_index, {
+        'role': 'user',
+        'content': text[entry_pos:].lstrip()  # Remove leading whitespace after the break
+    })
+
+
+MODIFIERS = {
+    'break_sys': modify_break_sys,
+}
+
+
 ###
 
 def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[Dict], Any]]) -> Tuple[str, Dict[str, Any]]:
@@ -168,8 +189,7 @@ def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[Dict], 
     removed from the text.
 
     Returns:
-        A tuple containing the cleaned text and extracted
-        parameters with their raw values.
+        A tuple containing the cleaned text and extracted parameters with their raw values.
     """
 
     pattern = re.compile(r'<([a-zA-Z0-9_]+)((?:=[^>]*)?)>', re.IGNORECASE)
@@ -226,22 +246,47 @@ def extract_and_remove_commands(text: str, handlers: Dict[str, Callable[[Dict], 
 def process_commands(valid_commands: Dict[str, Callable[[Dict], Any]], request: Dict) -> Dict[str, Any]:
     for message in request['messages']:
         if message.get('role') == 'system' and 'content' in message:
-            text, commands = extract_and_remove_commands(message['content'], valid_commands)
 
+            text, commands = extract_and_remove_commands(message['content'], valid_commands)
             if commands:
-                # Update the message content with the cleaned text
-                message['content'] = text
+                message['content'] = text  # Update the message content with the cleaned text
 
                 for command, value in commands.items():
-                    if command in COMMANDS:
+                    if command in valid_commands:
                         try:
-                            COMMANDS[command](request, value)
+                            valid_commands[command](request, value)
                         except Exception as e:
-                            logging.error(f"Failed to process command '{command}': {e}")
-                            # raise HTTPException(status_code=400, detail=f"Invalid command: {command_name}")
+                            msg = f"Failed to process command '{command}': {e}"
+                            logging.error(msg)
+                            # raise HTTPException(status_code=400, detail=msg)
             return commands
     return {}
 
+
+def process_modifiers(valid_modifiers: Dict[str, Callable[[Dict], Any]], request: Dict) -> Dict[str, Any]:
+    pattern = re.compile(r'<<([a-zA-Z0-9_]+)>>', re.IGNORECASE)
+
+    messages = request.get('messages')
+
+    message_index = 0
+    while message_index < len(messages):
+        message = messages[message_index]
+        if message.get('role') == 'system' and 'content' in message:
+
+            text = message['content']
+            match = pattern.search(text)
+            if match:
+                message['content'] = text[:match.start()] + text[match.end():]  # Remove the modifier tag
+                modifier = match.group(1).lower()
+                if modifier in valid_modifiers:
+                    try:
+                        valid_modifiers[modifier](messages, message_index, match.start())
+                    except Exception as e:
+                        msg = f"Failed to process modifier '{modifier}': {e}"
+                        logging.error(msg)
+                        # raise HTTPException(status_code=400, detail=msg)
+
+        message_index += 1
 
 def asResponse(text: str, finish_reason: str = None):
     choice = {
@@ -273,14 +318,6 @@ async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
     api_key = headers.get('Authorization')
     api_key = api_key.replace('Bearer ', '', 1)
     headers.pop('Authorization', None)
-
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"}
-    ]
 
     # convert messages
     contents = []
@@ -324,7 +361,7 @@ async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
             thinking_config['includeThoughts'] = True
         config['thinkingConfig'] = thinking_config
 
-    url = f"{AISTUDIO_URL}/{model}:generateContent?key={api_key}"
+    url = f'{AISTUDIO_URL}/{model}:generateContent?key={api_key}'
     async with httpx.AsyncClient(timeout=180.0) as client:
         response = await client.post(
             url,
@@ -332,7 +369,13 @@ async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
             json={
                 'contents': contents,
                 'systemInstruction': {'parts': system_instructions},
-                'safetySettings': safety_settings,
+                'safetySettings': [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+                    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"}
+                ],
                 'generationConfig': config,
             }
         )
@@ -426,6 +469,7 @@ async def _proxy_request(headers: dict, body: dict):
         body['model'] = DEFAULT_MODEL
 
     commands = process_commands(COMMANDS, body)
+    process_modifiers(MODIFIERS, body)
 
     print_json(body)
 
