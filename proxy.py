@@ -290,6 +290,9 @@ def process_modifiers(valid_modifiers: Dict[str, Callable[[Dict], Any]], request
 
 
 def asResponse(text: str, finish_reason: str = None):
+    if not text:
+        text = f'No response generated ({finish_reason})'
+
     choice = {
         'message': {
             'role': 'assistant',
