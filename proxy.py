@@ -361,12 +361,15 @@ async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
         if not body['reasoning'].get('enabled', False):
             # disable thinking if disabled, otherwise unset it to use default
             thinking_config['thinkingBudget'] = 0
+        else:
+            # when thinking is enabled, extend budget for it
+            thinking_config['thinkingBudget'] = 32768
         if commands.get('show_thinking', False):
             thinking_config['includeThoughts'] = True
         config['thinkingConfig'] = thinking_config
 
     url = f'{AISTUDIO_URL}/{model}:generateContent?key={api_key}'
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
             url,
             headers=headers,
