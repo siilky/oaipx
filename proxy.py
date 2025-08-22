@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Callable, Any, Tuple
 
@@ -10,7 +11,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import FileResponse, RedirectResponse
+from starlette.responses import FileResponse, RedirectResponse, StreamingResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +43,7 @@ OPENROUTER_URL = 'https://openrouter.ai/api/v1'
 OPENROUTER_COMPLETIONS_URL = OPENROUTER_URL + '/chat/completions'
 OPENROUTER_MODELS_URL = OPENROUTER_URL + '/models'
 DEFAULT_MODEL = 'openrouter/auto'
+TIMEOUT = 300
 
 
 def print_json(data, depth=1, current_level=1):
@@ -289,7 +291,7 @@ def process_modifiers(valid_modifiers: Dict[str, Callable[[Dict], Any]], request
         message_index += 1
 
 
-def asResponse(text: str, finish_reason: str = None):
+def _as_response(text: str, finish_reason: str = None):
     if not text:
         text = f'No response generated ({finish_reason})'
 
@@ -308,83 +310,105 @@ def asResponse(text: str, finish_reason: str = None):
     }
 
 
-def merge_thinking(text: str, reasoning: str) -> str:
+def _as_sse_response(obj: Dict[str, Any]) -> bytes:
+    return f'data: {json.dumps(obj, ensure_ascii=False)}\n\n'.encode('utf-8')
+
+
+def _merge_reasoning(text: str, reasoning: str) -> str:
     if reasoning:
         return f'<think>{reasoning}\n---\n</think>\n{text}'
     return text
 
 
-async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
-    model = body.get('model', DEFAULT_MODEL)
-    if model.startswith('google/'):
-        model = model.replace('google/', '', 1)
+async def _aistudio_request_streaming(url: str, headers: dict, body: dict, commands: dict):
+    DONE_EVENT = b"data: [DONE]\n\n"
+    reasoning_open = False
+    show_reasoning = commands.get('show_thinking', False)
 
-    api_key = headers.get('Authorization')
-    api_key = api_key.replace('Bearer ', '', 1)
-    headers.pop('Authorization', None)
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            async with client.stream('POST', url, headers=headers, json=body) as resp:
+                resp.raise_for_status()
 
-    # convert messages
-    contents = []
-    system_instructions = []
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line:
+                        continue
 
-    for message in body.get('messages', []):
-        if 'content' in message:
-            role = message.get('role', 'user').lower()
+                    # each line is a JSON object
+                    try:
+                        reply = json.loads(line)
+                    except json.JSONDecodeError:
+                        logging.error(f"❌ Invalid JSON response from API: {line}")
+                        yield _as_sse_response({'error': 'Invalid JSON response from API'})
+                        continue
 
-            if role == 'system':
-                system_instructions.append({'text': message['content']})
-                continue
+                    print_json(reply, 99)
 
-            if role != 'user':
-                role = 'model'
+                    finish_reason = None
+                    text = ''
 
-            contents.append({
-                'role': role,
-                'parts': [{'text': message['content']}]
-            })
+                    if 'candidates' in reply and reply['candidates']:
+                        candidate = reply['candidates'][0]
+                        parts = candidate.get('content', {}).get('parts', [])
 
-    config = {}
-    if 'temperature' in body:
-        config['temperature'] = body['temperature']
-    if 'top_p' in body:
-        config['topP'] = body['top_p']
-    if 'top_k' in body:
-        config['topK'] = body['top_k']
-    if 'presence_penalty' in body:
-        config['presencePenalty'] = body['presence_penalty']
-    if 'max_completion_tokens' in body:
-        config['maxOutputTokens'] = body['max_completion_tokens']
-    if 'stop' in body:
-        config['stopSequences'] = body['stop']
-    if 'reasoning' in body and isinstance(body['reasoning'], dict):
-        thinking_config = {}
-        if not body['reasoning'].get('enabled', False):
-            # disable thinking if disabled, otherwise unset it to use default
-            thinking_config['thinkingBudget'] = 0
-        else:
-            # when thinking is enabled, extend budget for it
-            thinking_config['thinkingBudget'] = 32768
-        if commands.get('show_thinking', False):
-            thinking_config['includeThoughts'] = True
-        config['thinkingConfig'] = thinking_config
+                        for part in parts:
+                            if not 'text' in part:
+                                continue
 
-    url = f'{AISTUDIO_URL}/{model}:generateContent?key={api_key}'
-    async with httpx.AsyncClient(timeout=300.0) as client:
+                            if 'thought' in part and part['thought']:
+                                if show_reasoning:
+                                    if not reasoning_open:
+                                        reasoning_open = True
+                                        text += '<think>'
+                                    text += part['text']
+                            else:
+                                if reasoning_open:
+                                    reasoning_open = False
+                                    text += '\n---\n</think>\n'
+                                text += part['text']
+
+                        finish_reason = candidate.get('finishReason')
+                        model_name = reply.get('modelVersion')
+                        id = reply.get('responseId')
+
+                        if finish_reason:
+                            if reasoning_open:
+                                reasoning_open = False
+                                text += '\n---\n</think>\n'
+
+                        out = {
+                            'id': id,
+                            'object': 'chat.completion.chunk',
+                            'created': int(time.time()),
+                            'model': model_name,
+                            'choices': [{
+                                'index': 0,
+                                'delta': {'content': text, 'role': 'assistant'},
+                            }]
+                        }
+
+                        if finish_reason:
+                            out['choices'][0]['finish_reason'] = finish_reason
+                            yield _as_sse_response(out)
+                            yield DONE_EVENT
+                        else:
+                            yield _as_sse_response(out)
+
+    except httpx.HTTPStatusError as e:
+        logging.error(f'❌ HTTP error {e.response.status_code}')
+        yield _as_sse_response({'error': f'HTTP error {e.response.status_code}'})
+        yield DONE_EVENT
+
+
+async def _aistudio_request(url: str, headers: dict, body: dict, commands: dict):
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         response = await client.post(
             url,
             headers=headers,
-            json={
-                'contents': contents,
-                'systemInstruction': {'parts': system_instructions},
-                'safetySettings': [
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-                    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"}
-                ],
-                'generationConfig': config,
-            }
+            json=body,
         )
 
         response.raise_for_status()
@@ -415,7 +439,7 @@ async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
             # merge reasoning into the content if show_thinking is True
             show_thinking = commands.get('show_thinking', False)
             if show_thinking and reasoning:
-                completion = merge_thinking(completion, reasoning)
+                completion = _merge_reasoning(completion, reasoning)
 
             finish_reason = candidate.get('finishReason', '')
         else:
@@ -426,7 +450,86 @@ async def _proxy_aistudio_request(headers: dict, body: dict, commands: dict):
             else:
                 completion = "❌ Invalid response from API: 'candidates' field missing or empty"
 
-        return asResponse(completion, finish_reason)
+        return _as_response(completion, finish_reason)
+
+
+async def _proxy_aistudio_request(headers: dict, request: dict, commands: dict):
+    model = request.get('model', DEFAULT_MODEL)
+    if model.startswith('google/'):
+        model = model.replace('google/', '', 1)
+
+    api_key = headers.get('Authorization')
+    api_key = api_key.replace('Bearer ', '', 1)
+    headers.pop('Authorization', None)
+
+    # convert messages
+    contents = []
+    system_instructions = []
+
+    for message in request.get('messages', []):
+        if 'content' in message:
+            role = message.get('role', 'user').lower()
+
+            if role == 'system':
+                system_instructions.append({'text': message['content']})
+                continue
+
+            if role != 'user':
+                role = 'model'
+
+            contents.append({
+                'role': role,
+                'parts': [{'text': message['content']}]
+            })
+
+    config = {}
+    if 'temperature' in request:
+        config['temperature'] = request['temperature']
+    if 'top_p' in request:
+        config['topP'] = request['top_p']
+    if 'top_k' in request:
+        config['topK'] = request['top_k']
+    if 'presence_penalty' in request:
+        config['presencePenalty'] = request['presence_penalty']
+    if 'max_completion_tokens' in request:
+        config['maxOutputTokens'] = request['max_completion_tokens']
+    if 'stop' in request:
+        config['stopSequences'] = request['stop']
+    if 'reasoning' in request and isinstance(request['reasoning'], dict):
+        thinking_config = {}
+        if not request['reasoning'].get('enabled', False):
+            # disable thinking if disabled, otherwise unset it to use default
+            thinking_config['thinkingBudget'] = 0
+        else:
+            # when thinking is enabled, extend budget for it
+            thinking_config['thinkingBudget'] = 32768
+        if commands.get('show_thinking', False):
+            thinking_config['includeThoughts'] = True
+        config['thinkingConfig'] = thinking_config
+
+    body = {
+        'contents': contents,
+        'systemInstruction': {'parts': system_instructions},
+        'safetySettings': [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"}
+        ],
+        'generationConfig': config,
+    }
+
+    if request.get('stream', False):
+        # if stream is requested, use streaming endpoint
+        url = f'{AISTUDIO_URL}/{model}:streamGenerateContent?alt=sse&key={api_key}'
+        return StreamingResponse(_aistudio_request_streaming(url, headers, body, commands),
+                                 media_type='text/event-stream',
+                                 headers={'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive'})
+    else:
+        # otherwise use the regular endpoint
+        url = f'{AISTUDIO_URL}/{model}:generateContent?key={api_key}'
+        return await _aistudio_request(url, headers, body, commands)
 
 
 async def _proxy_openrouter_request(headers: dict, body: dict, commands: dict):
@@ -464,7 +567,7 @@ async def _proxy_openrouter_request(headers: dict, body: dict, commands: dict):
             # merge reasoning into the content if show_thinking is True
             show_thinking = commands.get('show_thinking', False)
             if show_thinking and reasoning:
-                message['content'] = merge_thinking(message['content'], reasoning)
+                message['content'] = _merge_reasoning(message['content'], reasoning)
 
         return reply_data
 
@@ -501,9 +604,9 @@ async def _proxy_request(headers: dict, body: dict):
             return await _proxy_openrouter_request(headers, body, commands)
 
     except httpx.HTTPStatusError as e:
-        return asResponse(f"❌ Proxy Error {e.response.status_code}: {e.response.text}")
+        return _as_response(f"❌ Proxy Error {e.response.status_code}: {e.response.text}")
     except Exception as e:
-        return asResponse(f"❌ Proxy Error: {str(e)}")
+        return _as_response(f"❌ Proxy Error: {str(e)}")
 
 
 def copy_headers(request: Request) -> dict:
